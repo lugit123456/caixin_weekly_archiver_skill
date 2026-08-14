@@ -462,7 +462,33 @@ def _is_caixin_content_image(url: str) -> bool:
         parsed.scheme in {"http", "https"}
         and parsed.netloc.lower() in {"img.caixin.com", "datanews.caixin.com"}
         and parsed.path.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+        and "/common/images/" not in parsed.path.lower()
     )
+
+
+def _looks_like_datanews_article(source: str) -> bool:
+    return "datanews.caixin.com/mobile/article/article_xy/" in source or "<cxread" in source.lower()
+
+
+def _needs_datanews_browser_scroll(source: str, parsed: ParsedArticle) -> bool:
+    if not _looks_like_datanews_article(source):
+        return False
+    article_image_refs = source.count("datanews.caixin.com/mobile/article/article_xy/")
+    return article_image_refs < 5 or len(parsed.paragraphs) < 10
+
+
+def _chinese_char_count(value: str) -> int:
+    return len(re.findall(r"[\u4e00-\u9fff]", value))
+
+
+def _is_short_correction(title: str, body: str) -> bool:
+    return "编辑更正" in title and bool(body.strip()) and _chinese_char_count(body) >= 20
+
+
+def _has_active_charge_wall(doc: Any, title: str, body: str) -> bool:
+    if _is_short_correction(title, body):
+        return False
+    return bool(doc.xpath("//*[contains(concat(' ', normalize-space(@class), ' '), ' payreadwarp ')]"))
 
 
 def parse_article_page(
@@ -477,23 +503,32 @@ def parse_article_page(
     title = _first_text(doc, "//h1[1]")
     if not title:
         title = _first_attr(doc, "//meta[@property='og:title']", "content")
+    if not title:
+        title = _first_text(doc, "//title[1]")
 
     roots = doc.xpath("//*[@id='Main_Content_Val']")
+    datanews_roots = doc.xpath("//*[@id='mainArticle' and .//cxread]") if not roots else []
+    if datanews_roots:
+        roots = datanews_roots
     if not roots:
         raise ValueError("正文容器 #Main_Content_Val 不存在，可能未登录或页面结构已变化")
     root = roots[0]
     paragraphs: list[str] = []
-    for paragraph in root.xpath(".//p"):
-        if _has_excluded_ancestor(paragraph):
-            continue
-        text = node_text(paragraph)
-        if text:
-            paragraphs.append(text)
+    if datanews_roots:
+        for node in root.xpath(".//cxread"):
+            text = node_text(node)
+            if text:
+                paragraphs.append(text)
+    else:
+        for paragraph in root.xpath(".//p"):
+            if _has_excluded_ancestor(paragraph):
+                continue
+            text = node_text(paragraph)
+            if text:
+                paragraphs.append(text)
 
     body = "".join(paragraphs)
-    has_active_charge_wall = bool(
-        doc.xpath("//*[contains(concat(' ', normalize-space(@class), ' '), ' payreadwarp ')]")
-    )
+    has_active_charge_wall = _has_active_charge_wall(doc, title, body)
     if reject_truncated:
         if has_active_charge_wall:
             raise ValueError("HTTP 页面仍有付费墙，需要已登录浏览器获取全文")
@@ -503,6 +538,8 @@ def parse_article_page(
     image_nodes = doc.xpath(
         "//*[contains(concat(' ', normalize-space(@class), ' '), ' article_media_pic ')]//img"
         " | //*[@id='Main_Content_Val']//img"
+        " | //*[@id='intro']//img"
+        " | //*[contains(concat(' ', normalize-space(@class), ' '), ' imageBoxG ')]//img"
         " | //img[contains(concat(' ', normalize-space(@class), ' '), ' articleImageB ')]"
     )
     for image in image_nodes:
@@ -514,7 +551,11 @@ def parse_article_page(
                 image_urls.append(url)
                 break
 
-    if len(body) < min_chars and not (not body and image_urls and not has_active_charge_wall):
+    if (
+        len(body) < min_chars
+        and not _is_short_correction(title, body)
+        and not (not body and image_urls and not has_active_charge_wall)
+    ):
         visible_page_text = clean_text(" ".join(doc.itertext()))
         marker = next((item for item in PAYWALL_MARKERS if item in visible_page_text), "")
         suffix = f"（检测到：{marker}）" if marker else ""
@@ -562,6 +603,31 @@ class AuthenticatedBrowser:
             self.page.set.cookies(self.cookies)
         return self.page
 
+    def _scroll_lazy_article(self, page: Any) -> str:
+        latest_source = str(page.html or "")
+        stable_rounds = 0
+        previous_signature = ("", "", "")
+        for _ in range(14):
+            try:
+                page.run_js("window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                break
+            time.sleep(1)
+            latest_source = str(page.html or "")
+            signature = (
+                str(len(latest_source)),
+                str(latest_source.lower().count("<cxread")),
+                str(latest_source.count("datanews.caixin.com/mobile/article/article_xy/")),
+            )
+            if signature == previous_signature:
+                stable_rounds += 1
+                if stable_rounds >= 2:
+                    break
+            else:
+                stable_rounds = 0
+                previous_signature = signature
+        return latest_source
+
     def fetch_html(self, url: str) -> str:
         page = self._ensure_page()
         page.get(url)
@@ -569,6 +635,13 @@ class AuthenticatedBrowser:
         latest_source = ""
         while time.monotonic() < deadline:
             latest_source = str(page.html or "")
+            if _looks_like_datanews_article(latest_source):
+                latest_source = self._scroll_lazy_article(page)
+                try:
+                    parse_article_page(latest_source, url, reject_truncated=True)
+                    return latest_source
+                except ValueError:
+                    return latest_source
             try:
                 parse_article_page(latest_source, url, reject_truncated=True)
                 return latest_source
@@ -595,7 +668,10 @@ def fetch_and_parse_article(
     fetch_url = full_article_url(url)
     source = fetch_html(session, fetch_url)
     try:
-        return parse_article_page(source, fetch_url, reject_truncated=True)
+        parsed = parse_article_page(source, fetch_url, reject_truncated=True)
+        if browser is not None and _needs_datanews_browser_scroll(source, parsed):
+            raise ValueError("专题页需要浏览器滚动加载完整正文和图片")
+        return parsed
     except ValueError as first_error:
         if browser is None:
             raise
@@ -633,6 +709,16 @@ def extract_json_object(value: str) -> dict[str, Any]:
 
 
 def summarize_article(client: Any, config: dict[str, Any], title: str, section: str, body: str) -> str:
+    body_cn_count = _chinese_char_count(body)
+    if body_cn_count and body_cn_count < 120:
+        return clean_text(body)
+    min_summary_chars = 40 if body_cn_count < 500 else 300
+    max_summary_chars = 350 if body_cn_count < 500 else 750
+    length_instruction = (
+        "总结为 80-260 个汉字；若原文信息很少，可用一段短摘要概括核心事实。"
+        if body_cn_count < 500
+        else "总结为 350-650 个汉字。"
+    )
     prompt = f"""请为下面的财新周刊中文文章撰写一版适合中文读者阅读的中文总结，只返回严格 JSON。
 
 要求：
@@ -641,7 +727,7 @@ def summarize_article(client: Any, config: dict[str, Any], title: str, section: 
 3. 行文要符合中文财经报道和中文读者的表达习惯：语句通顺、衔接自然、信息密度高，避免生硬直译、口号式表达和机械罗列。
 4. 先交代文章最重要的结论或变化，再展开关键事实、背景原因、分歧争议、约束条件和后续影响；不要按原文段落顺序逐段复述。
 5. 保持必要的限定语，不把作者、受访者或机构观点改写成确定事实；涉及预测、判断、争议和风险时，明确其来源或条件。
-6. 总结为 350-650 个汉字。不要复述任何网页提示、广告、推荐阅读、订阅信息或评论。
+6. {length_instruction}不要复述任何网页提示、广告、推荐阅读、订阅信息或评论。
 
 分类：{section}
 标题：{title}
@@ -668,8 +754,8 @@ def summarize_article(client: Any, config: dict[str, Any], title: str, section: 
             )
             payload = extract_json_object(response.choices[0].message.content or "")
             summary = str(payload.get("summary_md") or "").strip()
-            cn_count = len(re.findall(r"[\u4e00-\u9fff]", summary))
-            if not 300 <= cn_count <= 750:
+            cn_count = _chinese_char_count(summary)
+            if not min_summary_chars <= cn_count <= max_summary_chars:
                 raise ValueError(f"总结字数不合格：{cn_count}")
             if re.search(r"^(?:#|[-*+]\s|\d+[.、)])", summary, flags=re.M):
                 raise ValueError("总结包含标题或列表")
@@ -1089,8 +1175,6 @@ def process_issue(args: argparse.Namespace, config: dict[str, Any]) -> list[dict
                 write_database_index(output_root)
                 log.info("已落库：%s（正文 %d 字，图片 %d 张）", article_id, len(parsed.body), len(images))
             except RuntimeError as exc:
-                if "浏览器页面仍未返回全文" in str(exc):
-                    raise
                 failures.append((candidate.url, str(exc)))
                 log.error("单篇处理失败，继续下一篇：%s", exc)
             except Exception as exc:

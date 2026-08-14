@@ -2,6 +2,7 @@
 .caixin-auth.json
 .caixin-browser/
 .venv/
+.browser_profile/
 venv/
 __pycache__/
 *.py[cod]

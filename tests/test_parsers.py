@@ -26,6 +26,7 @@ from sync_weekly import (
     read_archived_articles,
     save_auth_cookies,
     select_candidates,
+    summarize_article,
     write_database_index,
     write_issue_database,
 )
@@ -261,6 +262,23 @@ class ParserTests(unittest.TestCase):
         )
         self.assertEqual(len(article.paragraphs), 2)
 
+    def test_article_parser_accepts_short_correction_with_empty_paywall(self) -> None:
+        correction = """
+        <html><body><h1>编辑更正（《财新周刊》2026年第30期）</h1>
+          <div id="Main_Content_Val">
+            <p>本刊2026年第29期第38页右栏第五段第一句应为“清华大学智能产业研究院院长张亚勤告诉财新……”。特此更正。</p>
+          </div>
+          <div id="chargeWall" class="payreadwarp"><div class="content"></div></div>
+        </body></html>
+        """
+        article = parse_article_page(
+            correction,
+            "https://weekly.caixin.com/2026-08-01/102470479.html",
+            reject_truncated=True,
+        )
+        self.assertEqual(len(article.paragraphs), 1)
+        self.assertIn("特此更正", article.body)
+
     def test_article_parser_accepts_authenticated_image_only_page(self) -> None:
         image_only = """
         <html><body><h1>一周回溯</h1>
@@ -278,6 +296,72 @@ class ParserTests(unittest.TestCase):
         )
         self.assertEqual(article.paragraphs, [])
         self.assertEqual(article.image_urls, ["https://img.caixin.com/2026-08-08/weekly.jpg"])
+
+    def test_article_parser_supports_datanews_cxread_pages(self) -> None:
+        datanews = """
+        <html><head><title>显影｜巡护可可西里</title></head><body>
+          <div id="intro">
+            <img src="//datanews.caixin.com/mobile/article/article_xy/20260810_kekexili/1-1.jpg">
+          </div>
+          <div id="mainArticle">
+            <div id="authorGroup">
+              <img src="//datanews.caixin.com/mobile/article/common/images/editorIcon.png">
+              <cxread><a>摄影/撰稿｜作者</a></cxread>
+            </div>
+            <cxread><p>导语正文，说明高原巡护背景。</p></cxread>
+            <cxread><div>“章节标题”</div></cxread>
+            <cxread><p>第二段正文，继续讲述巡护现场和保护工作。</p></cxread>
+            <div class="imageBoxG">
+              <img class="articleImageB" src="//datanews.caixin.com/mobile/article/article_xy/20260810_kekexili/2.jpg">
+              <div class="imageText">图片说明</div>
+            </div>
+          </div>
+        </body></html>
+        """
+        article = parse_article_page(
+            datanews,
+            "https://weekly.caixin.com/2026-08-07/102472225.html",
+            min_chars=20,
+        )
+        self.assertEqual(article.title, "显影｜巡护可可西里")
+        self.assertEqual(len(article.paragraphs), 4)
+        self.assertIn("章节标题", article.body)
+        self.assertEqual(article.image_urls, [
+            "https://datanews.caixin.com/mobile/article/article_xy/20260810_kekexili/1-1.jpg",
+            "https://datanews.caixin.com/mobile/article/article_xy/20260810_kekexili/2.jpg",
+        ])
+
+    def test_summarize_article_returns_body_for_tiny_items(self) -> None:
+        client = Mock()
+        body = "本刊第29期一处表述有误，特此更正。"
+        summary = summarize_article(client, {"retries": 0}, "编辑更正", "开卷First Page", body)
+        self.assertEqual(summary, body)
+        self.assertFalse(client.chat.completions.create.called)
+
+    def test_summarize_article_allows_short_caption_summaries(self) -> None:
+        response = Mock()
+        response.choices = [
+            Mock(message=Mock(content=json.dumps({
+                "summary_md": "日本熊本县发生强震，熊本城和当地工厂受损，台积电、索尼等供应链停产疏散。灾区仍有停电断水，高温天气增加搜救和安置风险。"
+            }, ensure_ascii=False)))
+        ]
+        client = Mock()
+        client.chat.completions.create.return_value = response
+        config = {
+            "retries": 0,
+            "model": "test-model",
+            "max_tokens": 1000,
+            "temperature": 0.1,
+        }
+        body = (
+            "图｜视觉中国\n"
+            "当地时间2026年7月29日，日本熊本县八代市，日本制纸八代工厂因强震损毁。"
+            "此次地震造成死亡人数上升，熊本城城墙坍塌，台积电熊本厂、索尼半导体等停产。"
+            "灾区仍有大量居民停电断水，救援人员在高温天气下持续搜救。"
+            "日本气象厅提示未来仍有余震风险，地方政府要求避难所加强供水、降温和医疗保障。"
+        )
+        summary = summarize_article(client, config, "天眼｜熊本强震", "开卷First Page", body)
+        self.assertIn("熊本县发生强震", summary)
 
     def test_output_schema_matches_economist_paper_fields(self) -> None:
         candidate = ArticleCandidate("https://weekly.caixin.com/a.html", "金融Finance", "标题")
