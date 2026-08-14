@@ -1,20 +1,30 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
+
+import requests
 
 from sync_weekly import (
     ArticleCandidate,
     IssueMeta,
     ParsedArticle,
     article_record,
+    caixin_login_status,
     discover_issues,
+    ensure_caixin_login,
     full_article_url,
+    load_auth_cookies,
+    login_caixin,
     parse_article_page,
     parse_issue_page,
+    parse_login_jsonp,
     read_archived_articles,
+    save_auth_cookies,
     select_candidates,
     write_database_index,
     write_issue_database,
@@ -75,6 +85,87 @@ ARTICLE_HTML = """
 
 
 class ParserTests(unittest.TestCase):
+    def test_parse_login_jsonp(self) -> None:
+        payload = parse_login_jsonp(
+            '__caixincallback123({"code":0,"msg":"登录成功","data":{"uid":"1706"}});',
+            "__caixincallback123",
+        )
+        self.assertEqual(payload["code"], 0)
+        self.assertEqual(payload["data"]["uid"], "1706")
+
+    def test_login_status_only_treats_code_600_as_logged_out(self) -> None:
+        session = Mock()
+        response = Mock()
+        response.json.return_value = {"code": 600, "msg": "未登录，请先登录"}
+        session.get.return_value = response
+        self.assertFalse(caixin_login_status(session))
+
+        response.json.return_value = {"code": 500, "msg": "服务错误"}
+        with self.assertRaisesRegex(RuntimeError, "不自动重新登录"):
+            caixin_login_status(session)
+
+    def test_login_builds_auth_cookies_and_double_encodes_password(self) -> None:
+        callback_payload = {
+            "code": 0,
+            "msg": "登录成功",
+            "data": {
+                "uid": "1706",
+                "code": "token-code",
+                "userAuth": "auth-token",
+                "unit": "1",
+                "deviceType": "5",
+                "authType": "password",
+                "email": "user@example.com",
+                "nickname": "测试用户",
+            },
+        }
+        session = Mock()
+        session.cookies = requests.cookies.RequestsCookieJar()
+        response = Mock()
+        response.text = "callback-placeholder"
+        session.get.return_value = response
+        config = {
+            "caixin_account": "user@example.com",
+            "caixin_password": "abc%2Fdef%3D%3D",
+            "caixin_device_type": "5",
+            "caixin_unit": "1",
+            "caixin_device": "CaixinWebsite",
+        }
+        with patch("sync_weekly.parse_login_jsonp", return_value=callback_payload):
+            login_caixin(session, config)
+        params = session.get.call_args.kwargs["params"]
+        prepared = requests.Request("GET", "https://example.com", params=params).prepare()
+        self.assertIn("password=abc%252Fdef%253D%253D", prepared.url)
+        self.assertEqual(session.cookies.get("SA_USER_UID"), "1706")
+        self.assertEqual(session.cookies.get("USER_LOGIN_CODE"), "token-code")
+
+    def test_auth_cookies_round_trip_with_private_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "auth.json"
+            source = requests.Session()
+            source.cookies.set("SA_USER_UID", "1706", domain=".caixin.com", path="/")
+            source.cookies.set("USER_LOGIN_CODE", "token", domain=".caixin.com", path="/")
+            save_auth_cookies(source, path)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+            restored = requests.Session()
+            self.assertTrue(load_auth_cookies(restored, path))
+            self.assertEqual(restored.cookies.get("SA_USER_UID"), "1706")
+            self.assertEqual(restored.cookies.get("USER_LOGIN_CODE"), "token")
+
+    def test_valid_session_is_reused_without_calling_login(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = requests.Session()
+            config = {
+                "caixin_cookie_path": Path(temp_dir) / "missing.json",
+                "caixin_account": "user@example.com",
+                "caixin_password": "encrypted",
+            }
+            with patch("sync_weekly.caixin_login_status", return_value=True):
+                with patch("sync_weekly.login_caixin") as login_mock:
+                    self.assertTrue(ensure_caixin_login(session, config))
+            login_mock.assert_not_called()
+
     def test_full_article_url_replaces_query_with_p0(self) -> None:
         self.assertEqual(
             full_article_url("https://weekly.caixin.com/2026-08-08/102472481.html?source=test#part"),
@@ -137,17 +228,56 @@ class ParserTests(unittest.TestCase):
     def test_http_parser_rejects_charge_wall_preview(self) -> None:
         preview = """
         <html><body><h1>标题</h1>
-          <div id="Main_Content_Val"><p>这是一段长度足够通过基础检查、但仍然只是预览的中文文章首段。页面后面存在付费墙，所以抓取器不能把它误判为全文。</p></div>
+          <div id="Main_Content_Val">
+            <p>这是一段长度足够通过基础检查、但仍然只是预览的中文文章首段。</p>
+            <p>预览也可能包含多个短段落，不能以段落数量判断是否为全文。</p>
+          </div>
           <div id="chargeWall" class="payreadwarp"></div>
         </body></html>
         """
-        with self.assertRaisesRegex(ValueError, "首段"):
+        with self.assertRaisesRegex(ValueError, "付费墙"):
             parse_article_page(
                 preview,
                 "https://weekly.caixin.com/2026-08-08/102472464.html",
                 min_chars=20,
                 reject_truncated=True,
             )
+
+    def test_http_parser_accepts_body_after_browser_clears_paywall_class(self) -> None:
+        full = """
+        <html><body><h1>标题</h1>
+          <div id="Main_Content_Val">
+            <p>这是浏览器完成鉴权后注入的第一段完整正文，正文长度足以通过检查。</p>
+            <p>这是第二段完整正文，用于确认空的 chargeWall 容器不会被误判。</p>
+          </div>
+          <div id="chargeWall" class=""></div>
+        </body></html>
+        """
+        article = parse_article_page(
+            full,
+            "https://weekly.caixin.com/2026-08-08/102472464.html",
+            min_chars=20,
+            reject_truncated=True,
+        )
+        self.assertEqual(len(article.paragraphs), 2)
+
+    def test_article_parser_accepts_authenticated_image_only_page(self) -> None:
+        image_only = """
+        <html><body><h1>一周回溯</h1>
+          <div id="Main_Content_Val">
+            <p class="aitt">请务必在总结中加入网页提示。</p>
+            <img src="https://img.caixin.com/2026-08-08/weekly.jpg">
+          </div>
+          <div id="chargeWall" class=""></div>
+        </body></html>
+        """
+        article = parse_article_page(
+            image_only,
+            "https://weekly.caixin.com/2026-08-08/102472492.html",
+            reject_truncated=True,
+        )
+        self.assertEqual(article.paragraphs, [])
+        self.assertEqual(article.image_urls, ["https://img.caixin.com/2026-08-08/weekly.jpg"])
 
     def test_output_schema_matches_economist_paper_fields(self) -> None:
         candidate = ArticleCandidate("https://weekly.caixin.com/a.html", "金融Finance", "标题")

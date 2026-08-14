@@ -1,4 +1,6 @@
 .env
+.caixin-auth.json
+.caixin-browser/
 .venv/
 venv/
 __pycache__/

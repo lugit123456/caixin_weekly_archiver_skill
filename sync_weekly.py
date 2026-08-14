@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 
 import requests
 from dotenv import load_dotenv
@@ -27,12 +27,25 @@ from lxml import html as lxml_html
 
 ROOT = Path(__file__).resolve().parent
 HOME_URL = "https://weekly.caixin.com/"
+LOGIN_URL = "https://gateway.caixin.com/api/ucenter/user/v1/loginJsonp"
+USERINFO_URL = "https://gateway.caixin.com/api/ucenter/userinfo/get"
 PUBLICATION_TYPE = "CX"
 PUBLICATION_NAME = "Caixin Weekly"
 ARTICLE_URL_RE = re.compile(r"^https?://weekly\.caixin\.com/\d{4}-\d{2}-\d{2}/\d+\.html(?:\?.*)?$")
 ISSUE_URL_RE = re.compile(r"^https?://weekly\.caixin\.com/(\d{4})/(cw\d+)/?$")
 PAYWALL_MARKERS = ("阅读全文", "立即订阅", "订阅后畅读", "登录后阅读")
 EXCLUDED_PARAGRAPH_CLASSES = {"aitt", "dialog_desc"}
+LOGIN_COOKIE_FIELDS = {
+    "SA_USER_auth": "userAuth",
+    "UID": "uid",
+    "SA_USER_UID": "uid",
+    "SA_USER_NICK_NAME": "nickname",
+    "SA_USER_USER_NAME": "email",
+    "SA_USER_UNIT": "unit",
+    "SA_USER_DEVICE_TYPE": "deviceType",
+    "USER_LOGIN_CODE": "code",
+    "SA_AUTH_TYPE": "authType",
+}
 
 log = logging.getLogger("caixin-weekly")
 
@@ -136,6 +149,163 @@ def request_session() -> requests.Session:
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
     })
     return session
+
+
+def _cookie_value(value: Any) -> str:
+    """Match js-cookie's encoding closely enough for Caixin's cross-domain cookies."""
+    return quote(str(value), safe="!#$&()*+-./:<=>?@[]^_`{|}~")
+
+
+def _auth_cookie_rows(session: requests.Session) -> list[dict[str, Any]]:
+    names = set(LOGIN_COOKIE_FIELDS)
+    return [
+        {
+            "name": cookie.name,
+            "value": cookie.value,
+            "domain": cookie.domain or ".caixin.com",
+            "path": cookie.path or "/",
+            "expires": cookie.expires,
+        }
+        for cookie in session.cookies
+        if cookie.name in names
+    ]
+
+
+def load_auth_cookies(session: requests.Session, path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows = payload.get("cookies") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError("cookies 字段不存在")
+        for row in rows:
+            if not isinstance(row, dict) or row.get("name") not in LOGIN_COOKIE_FIELDS:
+                continue
+            kwargs: dict[str, Any] = {
+                "domain": str(row.get("domain") or ".caixin.com"),
+                "path": str(row.get("path") or "/"),
+            }
+            if row.get("expires") is not None:
+                kwargs["expires"] = int(row["expires"])
+            session.cookies.set(str(row["name"]), str(row.get("value") or ""), **kwargs)
+        return bool(_auth_cookie_rows(session))
+    except Exception as exc:
+        log.warning("登录 Cookie 文件无效，将重新检查登录态：%s", exc)
+        return False
+
+
+def save_auth_cookies(session: requests.Session, path: Path) -> None:
+    rows = _auth_cookie_rows(session)
+    if not rows:
+        raise RuntimeError("登录成功后没有可持久化的 Cookie")
+    payload = {
+        "version": 1,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "cookies": rows,
+    }
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    path.chmod(0o600)
+
+
+def parse_login_jsonp(source: str, callback: str) -> dict[str, Any]:
+    match = re.fullmatch(
+        rf"\s*{re.escape(callback)}\((.*)\);?\s*",
+        source,
+        flags=re.S,
+    )
+    if not match:
+        raise ValueError("财新登录接口未返回预期的 JSONP")
+    payload = json.loads(match.group(1))
+    if not isinstance(payload, dict):
+        raise ValueError("财新登录接口返回值不是 JSON object")
+    return payload
+
+
+def caixin_login_status(session: requests.Session, timeout: float = 30) -> bool:
+    """Return False only when Caixin explicitly reports that the session is logged out."""
+    try:
+        response = session.get(
+            USERINFO_URL,
+            headers={"Accept": "application/json, text/plain, */*", "Referer": "https://u.caixin.com/"},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"财新登录态检查失败，不自动重新登录：{exc}") from exc
+
+    code = payload.get("code")
+    if code == 0 and str((payload.get("data") or {}).get("uid") or ""):
+        return True
+    if code == 600:
+        return False
+    raise RuntimeError(
+        f"财新登录态检查返回未知状态，不自动重新登录：code={code}, msg={payload.get('msg', '')}"
+    )
+
+
+def login_caixin(session: requests.Session, config: dict[str, Any]) -> None:
+    callback = f"__caixincallback{int(time.time() * 1000)}"
+    params = {
+        "account": config["caixin_account"],
+        # CAIXIN_PASSWORD is the once-percent-encoded encrypted value. requests
+        # encodes the percent signs again, matching the browser's request URL.
+        "password": config["caixin_password"],
+        "deviceType": config["caixin_device_type"],
+        "unit": config["caixin_unit"],
+        "device": config["caixin_device"],
+        "userTag": "undefined",
+        "extend": json.dumps({"resource_article": ""}, separators=(",", ":")),
+        "callback": callback,
+    }
+    response = session.get(
+        LOGIN_URL,
+        params=params,
+        headers={"Accept": "*/*", "Referer": "https://u.caixin.com/"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = parse_login_jsonp(response.text, callback)
+    if payload.get("code") != 0:
+        raise RuntimeError(f"财新登录失败：code={payload.get('code')}, msg={payload.get('msg', '')}")
+
+    data = payload.get("data") or {}
+    if not isinstance(data, dict) or not data.get("uid") or not data.get("code") or not data.get("userAuth"):
+        raise RuntimeError("财新登录成功响应缺少 uid、code 或 userAuth")
+    for cookie_name, field_name in LOGIN_COOKIE_FIELDS.items():
+        value = data.get(field_name)
+        if value is not None:
+            session.cookies.set(
+                cookie_name,
+                _cookie_value(value),
+                domain=".caixin.com",
+                path="/",
+            )
+
+
+def ensure_caixin_login(session: requests.Session, config: dict[str, Any]) -> bool:
+    cookie_path: Path = config["caixin_cookie_path"]
+    loaded = load_auth_cookies(session, cookie_path)
+    if caixin_login_status(session):
+        log.info("财新登录态有效%s", "，已复用持久化 Cookie" if loaded else "")
+        return True
+
+    account = config["caixin_account"]
+    password = config["caixin_password"]
+    if not account or not password:
+        if account or password:
+            raise RuntimeError("CAIXIN_ACCOUNT 与 CAIXIN_PASSWORD 必须同时配置")
+        log.warning("财新当前未登录，且未配置 CAIXIN_ACCOUNT/CAIXIN_PASSWORD")
+        return False
+
+    log.info("财新当前未登录，调用登录接口获取新会话")
+    login_caixin(session, config)
+    if not caixin_login_status(session):
+        raise RuntimeError("财新登录接口返回成功，但新会话仍未通过登录态检查")
+    save_auth_cookies(session, cookie_path)
+    log.info("财新自动登录成功，Cookie 已持久化到 %s", cookie_path)
+    return True
 
 
 def fetch_html(session: requests.Session, url: str, timeout: float = 30) -> str:
@@ -321,15 +491,12 @@ def parse_article_page(
             paragraphs.append(text)
 
     body = "".join(paragraphs)
-    visible_page_text = clean_text(" ".join(doc.itertext()))
-    if len(body) < min_chars:
-        marker = next((item for item in PAYWALL_MARKERS if item in visible_page_text), "")
-        suffix = f"（检测到：{marker}）" if marker else ""
-        raise ValueError(f"正文过短，仅 {len(body)} 字{suffix}")
+    has_active_charge_wall = bool(
+        doc.xpath("//*[contains(concat(' ', normalize-space(@class), ' '), ' payreadwarp ')]")
+    )
     if reject_truncated:
-        has_charge_wall = bool(doc.xpath("//*[@id='chargeWall' or contains(concat(' ', normalize-space(@class), ' '), ' payreadwarp ')]"))
-        if has_charge_wall and len(paragraphs) == 1 and len(body) < 600:
-            raise ValueError("HTTP 页面只返回了付费文章首段，需要已登录浏览器获取全文")
+        if has_active_charge_wall:
+            raise ValueError("HTTP 页面仍有付费墙，需要已登录浏览器获取全文")
 
     image_urls: list[str] = []
     seen: set[str] = set()
@@ -347,16 +514,29 @@ def parse_article_page(
                 image_urls.append(url)
                 break
 
+    if len(body) < min_chars and not (not body and image_urls and not has_active_charge_wall):
+        visible_page_text = clean_text(" ".join(doc.itertext()))
+        marker = next((item for item in PAYWALL_MARKERS if item in visible_page_text), "")
+        suffix = f"（检测到：{marker}）" if marker else ""
+        raise ValueError(f"正文过短，仅 {len(body)} 字{suffix}")
+
     return ParsedArticle(title=title, paragraphs=paragraphs, image_urls=image_urls)
 
 
 class AuthenticatedBrowser:
     """Lazily start one authenticated Chromium and reuse it for the whole run."""
 
-    def __init__(self, profile_path: str, address: str = "", content_wait_s: float = 15) -> None:
+    def __init__(
+        self,
+        profile_path: str,
+        address: str = "",
+        content_wait_s: float = 15,
+        cookies: Iterable[Any] = (),
+    ) -> None:
         self.profile_path = profile_path
         self.address = address
         self.content_wait_s = content_wait_s
+        self.cookies = list(cookies)
         self.page: Any = None
 
     def _ensure_page(self) -> Any:
@@ -371,12 +551,15 @@ class AuthenticatedBrowser:
         if self.address:
             options.set_address(self.address)
         else:
-            options.set_user_data_path(self.profile_path)
+            if self.profile_path:
+                options.set_user_data_path(self.profile_path)
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
                 probe.bind(("127.0.0.1", 0))
                 port = int(probe.getsockname()[1])
             options.set_address(f"127.0.0.1:{port}")
         self.page = ChromiumPage(options)
+        if self.cookies:
+            self.page.set.cookies(self.cookies)
         return self.page
 
     def fetch_html(self, url: str) -> str:
@@ -422,8 +605,8 @@ def fetch_and_parse_article(
             return parse_article_page(browser_source, fetch_url, reject_truncated=True)
         except ValueError as browser_error:
             raise RuntimeError(
-                "浏览器页面仍未返回全文。请在 BROWSER_USER_DATA_PATH 对应的 Chrome profile "
-                "中登录财新，或配置已登录 Chromium 的 BROWSER_ADDRESS"
+                "浏览器页面仍未返回全文。请检查 CAIXIN_ACCOUNT/CAIXIN_PASSWORD 对应账号的"
+                "订阅权限，或检查 BROWSER_USER_DATA_PATH/BROWSER_ADDRESS"
             ) from browser_error
 
 
@@ -763,6 +946,14 @@ def load_config() -> dict[str, Any]:
         "max_images": int(os.getenv("LLM_MAX_IMAGES_PER_ARTICLE", "6") or 6),
         "delay_min": float(os.getenv("CRAWL_DELAY_MIN_S", "2") or 2),
         "delay_max": float(os.getenv("CRAWL_DELAY_MAX_S", "4") or 4),
+        "caixin_account": os.getenv("CAIXIN_ACCOUNT", "").strip(),
+        "caixin_password": os.getenv("CAIXIN_PASSWORD", "").strip(),
+        "caixin_device_type": os.getenv("CAIXIN_DEVICE_TYPE", "5").strip() or "5",
+        "caixin_unit": os.getenv("CAIXIN_UNIT", "1").strip() or "1",
+        "caixin_device": os.getenv("CAIXIN_DEVICE", "CaixinWebsite").strip() or "CaixinWebsite",
+        "caixin_cookie_path": Path(
+            os.getenv("CAIXIN_COOKIE_PATH", "").strip() or ROOT / ".caixin-auth.json"
+        ).expanduser(),
         "browser_profile": os.getenv("BROWSER_USER_DATA_PATH", "").strip(),
         "browser_address": os.getenv("BROWSER_ADDRESS", "").strip(),
         "browser_content_wait_s": float(os.getenv("BROWSER_CONTENT_WAIT_S", "15") or 15),
@@ -835,6 +1026,8 @@ def process_issue(args: argparse.Namespace, config: dict[str, Any]) -> list[dict
     if not args.no_summary and not config["api_key"]:
         raise RuntimeError("未配置 LLM_API_KEY；可先使用 --no-summary 验证抓取")
 
+    authenticated = ensure_caixin_login(session, config)
+
     output_root: Path = config["output_root"]
     issue_dir = output_root / PUBLICATION_TYPE / meta.issue_date
     if meta.cover_url:
@@ -851,11 +1044,12 @@ def process_issue(args: argparse.Namespace, config: dict[str, Any]) -> list[dict
     new_articles: list[dict[str, Any]] = []
     failures: list[tuple[str, str]] = []
     browser = None
-    if config["browser_profile"] or config["browser_address"]:
+    if authenticated or config["browser_profile"] or config["browser_address"]:
         browser = AuthenticatedBrowser(
-            config["browser_profile"],
+            config["browser_profile"] or str(ROOT / ".caixin-browser"),
             config["browser_address"],
             config["browser_content_wait_s"],
+            _auth_cookie_rows(session),
         )
 
     try:
@@ -869,7 +1063,11 @@ def process_issue(args: argparse.Namespace, config: dict[str, Any]) -> list[dict
                 article_id = f"art_{meta.issue_date}_{sequence:03d}"
                 sequence += 1
                 images = materialize_article_images(session, parsed.image_urls, issue_dir, article_id)
-                summary = "" if client is None else summarize_article(client, config, parsed.title, candidate.section, parsed.body)
+                summary = (
+                    ""
+                    if client is None or not parsed.body
+                    else summarize_article(client, config, parsed.title, candidate.section, parsed.body)
+                )
                 image_insights = [] if client is None else analyze_images(client, config, parsed.title, issue_dir, images)
                 record = article_record(
                     article_id=article_id,
@@ -914,12 +1112,14 @@ def process_issue(args: argparse.Namespace, config: dict[str, Any]) -> list[dict
 
 def process_single_url(args: argparse.Namespace, config: dict[str, Any]) -> list[dict[str, Any]]:
     session = request_session()
+    authenticated = ensure_caixin_login(session, config)
     browser = None
-    if config["browser_profile"] or config["browser_address"]:
+    if authenticated or config["browser_profile"] or config["browser_address"]:
         browser = AuthenticatedBrowser(
-            config["browser_profile"],
+            config["browser_profile"] or str(ROOT / ".caixin-browser"),
             config["browser_address"],
             config["browser_content_wait_s"],
+            _auth_cookie_rows(session),
         )
     try:
         parsed = fetch_and_parse_article(session, canonical_article_url(args.single_url), browser=browser)

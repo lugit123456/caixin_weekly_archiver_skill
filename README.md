@@ -13,7 +13,10 @@
 - 正文：只读取 `#Main_Content_Val` 内的 `<p>`，排除 `.aitt`、付费弹层、推荐、广告和评论。
 - 图片：读取 `.article_media_pic`、正文容器中的 `img.caixin.com` 图片，以及“显影”等图集页的
   `datanews.caixin.com` 大图；不读取推荐区和广告图。
-- 完整性：正文容器缺失或正文过短时拒绝入库，可使用已登录浏览器回退重试。
+- 登录态：先调用财新用户信息接口检查持久化 Cookie；仅在接口明确返回未登录时调用登录接口。
+- 完整性：只要页面仍有 `.payreadwarp` 就视为付费预览，不根据预览段落数量或字数猜测全文；
+  自动把登录 Cookie 注入 Chromium，等待该 class 被清除后再解析。
+- 图片页：登录后的页面若没有有效正文但有正文图片，按图片页归档，不把 `.aitt` 网页提示送给 LLM。
 
 示例文章页面中，`#the_content` 还包含相关报道、周刊封面、音频提示、印刷版推广、广告和评论，
 所以不能直接提取整个 `#the_content` 或页面所有 `<p>`。项目采用正文白名单，不依赖正文后的
@@ -32,22 +35,48 @@ cp .env.example .env
 在 `.env` 中填写 `LLM_API_KEY`。`LLM_BASE_URL` 可配置任何兼容 OpenAI Chat
 Completions 的服务。
 
-财新的匿名服务端 HTML 可能只返回首段，项目会检测并拒绝将预览误存为全文。要抓付费全文，
-请配置以下任一登录浏览器方式：
+财新的匿名服务端 HTML 可能只返回首段，项目会检测并拒绝将预览误存为全文。在 `.env` 配置
+财新账号和登录请求中使用的加密密码：
 
 ```dotenv
-# 连接已用 --remote-debugging-port 启动的 Chromium
+CAIXIN_ACCOUNT=your-account@example.com
+CAIXIN_PASSWORD=REPLACE_WITH_ONCE_PERCENT_ENCODED_ENCRYPTED_PASSWORD
+```
+
+`CAIXIN_PASSWORD` 不是明文密码，而是浏览器登录请求中解密前、只经过一次 URL 编码的字符串，
+例如值中的 `/`、`=` 分别写成 `%2F`、`%3D`。程序交给 `requests` 后会再编码一次，最终请求 URL
+中的 `%` 会显示为 `%25`，与浏览器请求一致。
+
+程序默认把登录 Cookie 保存到项目内 `.caixin-auth.json`，文件权限为 `0600`，且已加入
+`.gitignore`。每次抓取会先调用 `/api/ucenter/userinfo/get`：
+
+- 返回 `code=0` 时复用现有会话，不调用登录接口，避免不必要地挤掉其他设备。
+- 明确返回 `code=600` 时，才调用 `loginJsonp` 获取新 token 并更新 Cookie 文件。
+- 网络错误或未知状态会直接停止，不会把临时故障误判成退出登录后反复登录。
+
+可选配置：
+
+```dotenv
+# 留空时使用 .caixin-auth.json
+CAIXIN_COOKIE_PATH=
+
+# 一般无需修改，默认值与财新网页端一致
+CAIXIN_DEVICE_TYPE=5
+CAIXIN_UNIT=1
+CAIXIN_DEVICE=CaixinWebsite
+
+# 也可连接已用 --remote-debugging-port 启动的 Chromium
 BROWSER_ADDRESS=127.0.0.1:9222
 
-# 或使用独立的持久化 profile；首次运行会弹出 Chrome，请在其中登录一次
+# 或指定独立的持久化 profile
 BROWSER_USER_DATA_PATH=/absolute/path/to/caixin/chrome_profile
 BROWSER_CONTENT_WAIT_S=15
 ```
 
-项目不会读取、导出或写入你日常 Chrome 的 Cookie 文件。
-登录后的财新页面会先显示一段预览，再异步注入全文；抓取器会轮询正文，默认最多等待 15 秒。
+项目不会读取、导出或写入日常 Chrome 的 Cookie 文件。登录后的财新页面会先显示一段预览，
+再异步注入全文；抓取器会把自动登录 Cookie 注入独立 Chromium 并轮询正文，默认最多等待 15 秒。
 
-独立 profile 首次登录：
+只有在不配置账号密码、需要人工维护浏览器会话时才使用：
 
 ```bash
 python sync_weekly.py --login
@@ -127,4 +156,4 @@ python -m py_compile sync_weekly.py
 ## 版权与安全
 
 抓取结果含付费原文，只应供个人阅读和研究，不要公开部署或提交 `database.js`、图片、`.env`、
-浏览器 profile 等内容。财新内容版权归财新传媒所有。
+`.caixin-auth.json`、浏览器 profile 等内容。财新内容版权归财新传媒所有。
